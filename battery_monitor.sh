@@ -10,6 +10,14 @@ else
     exit 1
 fi
 
+
+# ===== Vega Logging Setup =====
+JUL25_DIR="/tmp/jul25"
+mkdir -p "$JUL25_DIR"
+CURRENT_HOUR=$(date +"%H")
+MONITOR_FILE="${JUL25_DIR}/${CURRENT_HOUR}-battery-monitor.txt"
+STATUS_FILE="${JUL25_DIR}/${CURRENT_HOUR}-status.txt"
+
 # ===== Battery Functions =====
 get_battery_info() {
     upower -i "$(upower -e | grep BAT)" 2>/dev/null
@@ -23,12 +31,12 @@ get_battery_percent() {
     get_battery_info | grep -oP 'percentage:\s*\K[0-9]+'
 }
 
-confirm_with_user() {
-    return 0  # stubbed for systemd compatibility
-}
-
 # ===== Logging =====
-log_power_consumers() {
+log_power_consumers()
+{
+        # Vega battery monitor writes
+        echo "yes" > "$MONITOR_FILE"
+        ps -eo pid,cmd,%cpu --sort=-%cpu | head -n 10 > "$STATUS_FILE"
     echo "Top power-consuming apps at $(date):" >> "$POWER_LOG"
     ps -eo pid,ppid,cmd,%mem,%cpu --sort=-%cpu | head -n 15 >> "$POWER_LOG"
     echo "----------------------------------------" >> "$POWER_LOG"
@@ -75,6 +83,8 @@ force_kill_apps() {
 }
 
 # ===== Main Logic =====
+echo "Computer up at $(date):" >> "$UPTIME_SCH"
+echo "Running..." >> /tmp/battery_monitor_runtime.log
 battery=$(get_battery_percent)
 plugged=$(is_plugged_in && echo "yes" || echo "no")
 
@@ -82,6 +92,9 @@ if [[ -z "$battery" || "$plugged" == "no" || "$battery" -lt 90 ]]; then
     logger -t battery_monitor "Battery check failed: plugged=$plugged, percent=$battery"
     confirm_with_user || {
         log_power_consumers
+        # Vega battery monitor writes
+        echo "yes" > "$MONITOR_FILE"
+        ps -eo pid,cmd,%cpu --sort=-%cpu | head -n 10 > "$STATUS_FILE"
         while true; do
             battery=$(get_battery_percent)
             [[ -z "$battery" ]] && break
@@ -95,6 +108,7 @@ if [[ -z "$battery" || "$plugged" == "no" || "$battery" -lt 90 ]]; then
         log_turn_off_candidates
         while true; do
             battery=$(get_battery_percent)
+            echo "Computer still up at $(date):" >> "$UPTIME_SCH"
             if [[ -z "$battery" ]]; then
                 echo "Could not read battery. Apps still consuming power:" > "$ERROR_LOG"
                 cat "$TURN_OFF_LOG" >> "$ERROR_LOG"
@@ -102,6 +116,7 @@ if [[ -z "$battery" || "$plugged" == "no" || "$battery" -lt 90 ]]; then
                 exit 1
             fi
             if [[ "$battery" -lt 30 ]]; then
+                echo "Computer up but battery low at $(date):" >> "$UPTIME_SCH"
                 logger -t battery_monitor "Battery below 30%. Forcing high-CPU apps to close."
                 for app in $(ps -eo cmd --sort=-%cpu | head -n 15 | awk '{print $1}' | sort | uniq); do
                     force_close_apps "$app"
