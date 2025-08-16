@@ -1,218 +1,218 @@
 #!/bin/bash
-# battery_monitor_function.sh
-# Minimal, adaptive battery saver that preserves your existing env + tools.
+# battery_monitor_function.sh — v1.0.0
+# - NEVER kills Chrome.
+# - Detects real drain (smoothed %/min OR high watts) when battery <= threshold.
+# - Signals a local relay (http://127.0.0.1:8165) used by the Chrome extension.
+# - Logs CSV + journald.
+# - Between 2025-08-19 and 2025-08-24 (inclusive start, exclusive end), writes
+#   a health breadcrumb to chatgpt.txt so you can paste it to ChatGPT.
 
-set -u
-set -o pipefail
+set -Eeuo pipefail
 
-# ===== Load Private Config =====
-CONFIG_FILE="$(dirname "$0")/.battery_monitor.env"
-if [[ -f "$CONFIG_FILE" ]]; then
-  # shellcheck disable=SC1090
-  source "$CONFIG_FILE"
-else
-  echo "ERROR: Config file $CONFIG_FILE not found." >&2
-  exit 1
-fi
+VERSION="1.0.0"
 
-# ===== Defaults (overridable in .battery_monitor.env) =====
-LOGGER_TAG="${LOGGER_TAG:-battery_monitor}"
-CHATGPT_FILE="${CHATGPT_FILE:-/home/we6jbo/Learn-Ivrit-Recordings/battery_reports/chatgpt.txt}"
-STATUS_FILE="${STATUS_FILE:-/tmp/battery_status.txt}"
-UPTIME_SCH="${UPTIME_SCH:-/tmp/uptime_scheduled.log}"
-METRICS_CSV="${METRICS_CSV:-/home/we6jbo/Learn-Ivrit-Recordings/battery_reports/metrics.csv}"
-VEGA_DIR="${VEGA_DIR:-/tmp/jul25}"
+# -------- Paths --------
+BASE_DIR="/home/we6jbo/Learn-Ivrit-Recordings/battery_reports"
+METRICS="${BASE_DIR}/metrics.csv"
+CHATGPT_FILE="${BASE_DIR}/chatgpt.txt"
 
-# Thresholds & cadence
-LOW_BATT_THRESHOLD="${LOW_BATT_THRESHOLD:-30}"     # legacy behavior trigger
-T90="${T90:-90}"   # start *very* light nudges below this when discharging
-T70="${T70:-70}"
-T50="${T50:-50}"
-T30="${T30:-30}"   # heavy-handed begins below here
+# Local relay for the extension
+RELAY_HOST="127.0.0.1"
+RELAY_PORT="8165"
 
-SAMPLE_SLEEP="${SAMPLE_SLEEP:-5}"      # how often battery_monitor.sh calls us
-BACKOFF_SHORT="${BACKOFF_SHORT:-60}"   # cooldown after any intervention
-BACKOFF_HEAVY="${BACKOFF_HEAVY:-300}"  # cooldown after aggressive interventions
+# -------- Tunables --------
+LOW_TRIM_PCT=15           # (optional; disabled below) trim non-browser hogs when idle
+MIN_PCT_FOR_SIGNAL=25     # only signal the extension at/under this %
+DRAIN_SEVERE=3            # smoothed %/min threshold to signal
+MIN_WINDOW_SECS=90        # smoothing window for %/min calculation
+BIG_WATTS=12              # >= watts also considered "big drain"
+IDLE_LIMIT_MS=60000       # "active" if input < 60s ago
+COOLDOWN_SECS=180         # min gap between identical signals
 
-# Kill policy knobs
-TOP_N_MILD="${TOP_N_MILD:-5}"
-TOP_N_MODERATE="${TOP_N_MODERATE:-10}"
-TOP_N_AGGRESSIVE="${TOP_N_AGGRESSIVE:-15}"
+# State files
+STATE_DIR="/tmp"
+DROP_ANCHOR="${STATE_DIR}/j03_batt_anchor.json"   # {"pct":X,"ts":epoch}
+COOLDOWN_FILE="${STATE_DIR}/j03_signal_cooldown.ts"
 
-# Safety: never kill these (prefix match on command)
-SAFE_CMD_ALLOWLIST="${SAFE_CMD_ALLOWLIST:-/usr/bin/ssh /bin/login /sbin/init /usr/sbin/NetworkManager /usr/bin/Xorg /usr/bin/wayland /usr/bin/gnome-shell /usr/bin/kwin_x11 /usr/bin/kwin_wayland /usr/bin/sddm /usr/bin/lightdm /usr/bin/systemd /usr/bin/journalctl /usr/bin/loginctl /usr/bin/sudo /bin/bash /usr/bin/bash /usr/bin/zsh /usr/bin/fish}"
-
-mkdir -p "$(dirname "$CHATGPT_FILE")" "$(dirname "$STATUS_FILE")" "$(dirname "$UPTIME_SCH")" "$(dirname "$METRICS_CSV")" "$VEGA_DIR"
-touch "$CHATGPT_FILE" "$STATUS_FILE" "$UPTIME_SCH" "$METRICS_CSV"
-
-log() { logger -t "$LOGGER_TAG" -- "$*"; }
-
-append_today_once() {
-  local today; today="$(date +%F)"
-  grep -q "$today" "$CHATGPT_FILE" || echo "$today" >> "$CHATGPT_FILE"
+# -------- Time-window gate for chatgpt.txt breadcrumbs --------
+_status_gate_ok() {
+  local now_ts start_ts end_ts
+  now_ts="$(date +%s)"
+  start_ts="$(date -d '2025-08-19 00:00:00' +%s)"
+  end_ts="$(date -d '2025-08-25 00:00:00' +%s)"   # exclusive
+  [ "$now_ts" -ge "$start_ts" ] && [ "$now_ts" -lt "$end_ts" ]
 }
 
-# ---- Battery readers (use your existing stack: upower/acpi/sysfs) ----
-detect_battery_sysfs() {
-  local psdir="/sys/class/power_supply"
-  local batdir; batdir="$(ls -d "$psdir"/BAT* 2>/dev/null | head -n1 || true)"
-  local acdir;  acdir="$(ls -d "$psdir"/AC* "$psdir"/ADP* 2>/dev/null | head -n1 || true)"
-  [[ -z "$batdir" ]] && { echo "" ""; return 1; }
-  local cap state; cap="$(tr -d '%' < "$batdir/capacity" 2>/dev/null || echo 0)"
-  state="$(cat "$batdir/status" 2>/dev/null || echo "")"
-  if [[ -n "$acdir" && -f "$acdir/online" && "$(cat "$acdir/online" 2>/dev/null)" == "1" ]]; then
-    state="Charging"
+# -------- Idle detection (service-safe) --------
+is_user_active() {
+  if command -v xprintidle >/dev/null 2>&1 && env | grep -q '^DISPLAY='; then
+    local ms; ms="$(xprintidle 2>/dev/null || echo 999999)"
+    [ "$ms" -lt "$IDLE_LIMIT_MS" ] && return 0 || return 1
   fi
-  echo "$cap" "$state"
-}
-
-read_battery() {
-  if command -v upower >/dev/null 2>&1; then
-    local dev; dev="$(upower -e 2>/dev/null | grep -E 'BAT|battery' | head -n1)"
-    if [[ -n "$dev" ]]; then
-      local pct state
-      pct="$(upower -i "$dev" | awk -F: '/percentage/{gsub(/[% ]/,"",$2);print $2;exit}')"
-      state="$(upower -i "$dev" | awk -F: '/state/{gsub(/^[ \t]+/,"",$2);print $2;exit}')"
-      [[ -n "$pct" && -n "$state" ]] && { echo "$pct" "$state"; return 0; }
-    fi
+  if command -v loginctl >/dev/null 2>&1; then
+    local hint
+    hint="$(loginctl show-user "${SUDO_USER:-$USER}" 2>/dev/null | awk -F= '/^IdleHint=/{print $2}')"
+    [ "$hint" = "no" ] && return 0 || return 1
   fi
-  if command -v acpi >/dev/null 2>&1; then
-    local line pct state
-    line="$(acpi -b 2>/dev/null | head -n1)"
-    pct="$(echo "$line" | grep -oE '[0-9]+%' | tr -d '%')"
-    state="$(echo "$line" | awk -F'[,: ]+' '{print $3}')"
-    [[ -n "$pct" && -n "$state" ]] && { echo "$pct" "$state"; return 0; }
-  fi
-  detect_battery_sysfs
-}
-
-# ---- Process selection & kill logic ----
-is_safe_cmd() {
-  local cmd="$1"
-  for safe in $SAFE_CMD_ALLOWLIST; do
-    [[ "$cmd" == "$safe"* ]] && return 0
-  done
+  # Unknown => treat as idle (safer for battery conservation)
   return 1
 }
 
-list_top_cmds() {
-  local limit="$1"
-  # unique command path list by CPU
-  ps -eo cmd,%cpu --sort=-%cpu | awk 'NR<=50{print $1}' | sort | uniq | head -n "$limit"
+# -------- Battery / power helpers --------
+battery_pct() {
+  upower -i /org/freedesktop/UPower/devices/battery_BAT0 2>/dev/null \
+    | awk '/percentage/ {gsub("%",""); print $2; exit}'
 }
 
-graceful_then_bruteforce() {
-  local cmd="$1" killed=0
-  [[ -z "$cmd" ]] && return 0
-  is_safe_cmd "$cmd" && return 0
-
-  # Graceful TERM
-  pkill -f -- "$cmd" 2>/dev/null && killed=1
-  sleep 2
-  # Escalate only if still present
-  pgrep -f -- "$cmd" >/dev/null 2>&1 && pkill -9 -f -- "$cmd" 2>/dev/null && killed=2
-  echo "$killed"
+battery_state() {
+  upower -i /org/freedesktop/UPower/devices/battery_BAT0 2>/dev/null \
+    | awk '/state/ {print $2; exit}'
 }
 
-write_status_file() {
-  local pct="$1" state="$2"
-  {
-    echo "=== Battery Status $(date '+%Y-%m-%d %H:%M:%S') ==="
-    echo "Battery: ${pct}%"
-    echo "State:   ${state}"
-    echo
-    echo "Top power-consuming commands:"
-    ps -eo cmd,%cpu --sort=-%cpu | awk 'NR<=25{printf("%-50s %s%%\n",$1,$2)}'
-  } > "$STATUS_FILE"
+battery_watts() {
+  # Returns integer watts (floor). If unavailable, 0.
+  local w
+  w="$(upower -i /org/freedesktop/UPower/devices/battery_BAT0 2>/dev/null | awk '/energy-rate/ {print $2; exit}')"
+  printf '%s\n' "${w%.*:-0}"
 }
 
-# ---- Metrics logging ----
-ensure_metrics_header() {
-  if [[ ! -s "$METRICS_CSV" ]]; then
-    echo "timestamp,battery_percent,state,policy_level,topN,killed_count,backoff_seconds" >> "$METRICS_CSV"
-  fi
-}
+smoothed_drop_rate() {
+  # Compute %/min using an anchor at least MIN_WINDOW_SECS old
+  local pct_now ts_now pct_prev ts_prev dt dp rate
+  pct_now="$1"; ts_now="$(date +%s)"
 
-log_metrics() {
-  local pct="$1" state="$2" level="$3" topn="$4" killed="$5" backoff="$6"
-  ensure_metrics_header
-  printf "%s,%s,%s,%s,%s,%s,%s\n" "$(date '+%F %T')" "$pct" "$state" "$level" "$topn" "$killed" "$backoff" >> "$METRICS_CSV"
-}
-
-# ---- Intervention policies (adaptive) ----
-policy_nudge_mild() {
-  # Close a few heavy hitters (gentle)
-  local pct="$1" state="$2" killed=0
-  mapfile -t cmds < <(list_top_cmds "$TOP_N_MILD")
-  for c in "${cmds[@]}"; do
-    r="$(graceful_then_bruteforce "$c")"
-    (( killed += r ))
-  done
-  log "MILD intervention: killed=$killed (units 1=TERM,2=KILL)"
-  log_metrics "$pct" "$state" "mild" "$TOP_N_MILD" "$killed" "$BACKOFF_SHORT"
-  sleep "$BACKOFF_SHORT"
-}
-
-policy_nudge_moderate() {
-  local pct="$1" state="$2" killed=0
-  mapfile -t cmds < <(list_top_cmds "$TOP_N_MODERATE")
-  for c in "${cmds[@]}"; do
-    r="$(graceful_then_bruteforce "$c")"
-    (( killed += r ))
-  done
-  log "MODERATE intervention: killed=$killed"
-  log_metrics "$pct" "$state" "moderate" "$TOP_N_MODERATE" "$killed" "$BACKOFF_SHORT"
-  sleep "$BACKOFF_SHORT"
-}
-
-policy_aggressive() {
-  local pct="$1" state="$2" killed=0
-  mapfile -t cmds < <(list_top_cmds "$TOP_N_AGGRESSIVE")
-  for c in "${cmds[@]}"; do
-    r="$(graceful_then_bruteforce "$c")"
-    (( killed += r ))
-  done
-  echo "Computer up but battery low at $(date):" >> "$UPTIME_SCH"
-  log "AGGRESSIVE intervention: killed=$killed"
-  log_metrics "$pct" "$state" "aggressive" "$TOP_N_AGGRESSIVE" "$killed" "$BACKOFF_HEAVY"
-  sleep "$BACKOFF_HEAVY"
-}
-
-# ---- Main control ----
-main() {
-  append_today_once
-
-  local pct state
-  read -r pct state < <(read_battery)
-  [[ -z "${pct:-}" || -z "${state:-}" ]] && { log "WARN: Unable to read battery status."; write_status_file "N/A" "unknown"; return 0; }
-
-  write_status_file "$pct" "$state"
-
-  # Only act if discharging
-  if [[ "$state" == "discharging" || "$state" == "Discharging" ]]; then
-    if   (( pct < T30 )); then
-      policy_aggressive "$pct" "$state"
-    elif (( pct < T50 )); then
-      policy_nudge_moderate "$pct" "$state"
-    elif (( pct < T70 )); then
-      policy_nudge_mild "$pct" "$state"
-    elif (( pct < T90 )); then
-      # Very light nudge or do nothing; choose mild with very small TOP_N if desired
-      policy_nudge_mild "$pct" "$state"
-    else
-      # >= T90: no action; just observe
-      :
+  if [ -s "$DROP_ANCHOR" ]; then
+    pct_prev="$(awk -F'[,:}]' '{for(i=1;i<=NF;i++){if($i ~ /"pct"/){print $(i+1)}}}' "$DROP_ANCHOR" | tr -d ' ')"
+    ts_prev="$(awk -F'[,:}]' '{for(i=1;i<=NF;i++){if($i ~ /"ts"/){print $(i+1)}}}' "$DROP_ANCHOR" | tr -d ' ')"
+    if [[ "$pct_prev" =~ ^[0-9]+$ ]] && [[ "$ts_prev" =~ ^[0-9]+$ ]]; then
+      dt=$(( ts_now - ts_prev ))
+      if [ "$dt" -ge "$MIN_WINDOW_SECS" ]; then
+        dp=$(( pct_prev - pct_now ))
+        rate=$(( dp > 0 ? dp * 60 / dt : 0 ))
+        printf '{"pct":%s,"ts":%s}\n' "$pct_now" "$ts_now" > "$DROP_ANCHOR" 2>/dev/null || true
+        echo "$rate"; return 0
+      fi
+      echo "0"; return 0
     fi
+  fi
+  printf '{"pct":%s,"ts":%s}\n' "$pct_now" "$(date +%s)" > "$DROP_ANCHOR" 2>/dev/null || true
+  echo "0"
+}
 
-    # Legacy behavior: ensure we still honor your original "below threshold" block
-    if (( pct < LOW_BATT_THRESHOLD )); then
-      log "Battery below ${LOW_BATT_THRESHOLD}% (legacy trigger)."
-      # already handled by policies above; message kept for continuity
+# -------- Optional: light hygiene at very low battery (non-browser only) --------
+kill_noncritical() {
+  # Disabled by default; comment-in the call in "Main" to enable.
+  # Avoid browsers; TERM top 5 CPU hogs >35%
+  local p pid cmd
+  while read -r p; do
+    pid="${p%%:*}"; cmd="${p#*:}"
+    [[ "$cmd" =~ chrome|chromium|firefox ]] && continue
+    kill -TERM "$pid" 2>/dev/null || true
+    sleep 2
+  done < <(ps -eo pid,comm,%cpu --sort=-%cpu | awk '$3>35 {print $1":"$2}' | head -n 5)
+}
+
+# -------- Cooldown --------
+cooldown_active() {
+  local now ts
+  now="$(date +%s)"
+  if [ -s "$COOLDOWN_FILE" ]; then
+    ts="$(cat "$COOLDOWN_FILE" 2>/dev/null || echo 0)"
+    [ $(( now - ts )) -lt "$COOLDOWN_SECS" ] && return 0
+  fi
+  return 1
+}
+start_cooldown() { date +%s > "$COOLDOWN_FILE" 2>/dev/null || true; }
+
+# -------- Signaling (to relay) --------
+emit_signal() {
+  # Best-effort POST to relay; extension will pick this up and prompt the user.
+  command -v curl >/dev/null 2>&1 && \
+    curl -m 0.8 -s -o /dev/null -X POST -H "Content-Type: application/json" \
+      --data "{\"ts\":\"$(date '+%F %T')\",\"action\":\"terminate-chrome\",\"reason\":\"$1\",\"battery_pct\":$2,\"drop_per_min\":$3,\"watts\":$4,\"idle\":$5,\"function_version\":\"$VERSION\"}" \
+      "http://${RELAY_HOST}:${RELAY_PORT}/signal" || true
+}
+
+clear_signal() {
+  command -v curl >/dev/null 2>&1 && \
+    curl -m 0.8 -s -o /dev/null -X POST "http://${RELAY_HOST}:${RELAY_PORT}/clear" || true
+}
+
+# -------- CSV/Journald logging --------
+log_metrics() {
+  local tier="$1" pct="$2" drop="$3" watts="$4" reason="$5" idle_ms="$6" action="$7"
+  mkdir -p "$BASE_DIR"
+  if [ ! -f "$METRICS" ]; then
+    printf 'timestamp,tier,pct,drop_per_min,watts,reason,idle_ms,action,version\n' > "$METRICS"
+  fi
+  printf '%s,%s,%s,%s,%s,%s,%s,%s,%s\n' \
+    "$(date '+%F %T')" "$tier" "$pct" "$drop" "$watts" "$reason" "$idle_ms" "$action" "$VERSION" >> "$METRICS"
+  logger -t battery_monitor "tier=${tier} pct=${pct} drop=${drop}/min watts=${watts} reason=${reason} idle_ms=${idle_ms} action=${action} version=${VERSION}" || true
+}
+
+# -------- Health breadcrumb to chatgpt.txt (time-boxed) --------
+status_note_function() {
+  local stamp="/tmp/j03_health_fn_last.ts" now
+  now="$(date +%s)"
+  if [ -f "$stamp" ] && [ $(( now - $(cat "$stamp" 2>/dev/null || echo 0) )) -lt 60 ]; then return 0; fi
+  echo "$now" > "$stamp" 2>/dev/null || true
+  printf '%s\tbattery_function v%s\tstate=%s pct=%s drop=%s/min watts=%s idle=%s action=%s reason=%s\n' \
+    "$(date '+%F %T')" "$VERSION" "$state" "$pct" "$drop_rate" "$watts" "$idle" "$action" "$reason" >> "$CHATGPT_FILE"
+}
+
+# ===========================
+# Main decision logic
+# ===========================
+pct="$(battery_pct || echo 100)"
+state="$(battery_state || echo unknown)"
+watts="$(battery_watts || echo 0)"
+drop_rate="$(smoothed_drop_rate "$pct")"   # %/min over >=90s window
+
+idle=1; is_user_active && idle=0
+idle_ms="-1"
+if command -v xprintidle >/dev/null 2>&1 && env | grep -q '^DISPLAY='; then
+  idle_ms="$(xprintidle 2>/dev/null || echo -1)"
+fi
+
+tier="OK"; reason="normal"; action="none"
+
+if [ "$state" = "discharging" ]; then
+  # Optional low-battery hygiene (keeps Chrome safe)
+  # if [ "$pct" -le "$LOW_TRIM_PCT" ] && [ "$idle" -eq 1 ]; then
+  #   kill_noncritical
+  #   tier="LOW_TRIM"; reason="pct<=${LOW_TRIM_PCT}% trimmed non-browsers"; action="TERM_noncritical"
+  # fi
+
+  # Only consider signaling the extension when battery is actually low
+  if [ "$pct" -le "$MIN_PCT_FOR_SIGNAL" ]; then
+    # "Real" big drain if smoothed %/min OR watts exceed thresholds
+    if [ "$drop_rate" -ge "$DRAIN_SEVERE" ] || [ "$watts" -ge "$BIG_WATTS" ]; then
+      if cooldown_active; then
+        tier="COOLDOWN"; reason="cooldown_active skip_signal"; action="none"
+      else
+        tier="DRAIN_SEVERE"
+        reason="smoothed>=${DRAIN_SEVERE}%/min OR watts>=${BIG_WATTS}"
+        emit_signal "$reason" "$pct" "$drop_rate" "$watts" "$idle"
+        action="SIGNAL_extension"
+        start_cooldown
+      fi
+    else
+      # Drain below threshold at low pct -> clear any prior signal
+      clear_signal
+      tier="LOW_OK"; reason="low_pct_but_normal_drain"
     fi
   else
-    log "Battery OK: ${pct}% and state=${state}"
+    # Battery above threshold -> clear any prior signal
+    clear_signal
   fi
-}
+else
+  # Charging/unknown -> clear signals
+  clear_signal
+  tier="CHARGING_OR_UNKNOWN"; reason="$state"
+fi
 
-main "$@"
+log_metrics "$tier" "$pct" "$drop_rate" "$watts" "$reason" "$idle_ms" "$action"
+
+# Time-boxed breadcrumb for ChatGPT (Aug 19–24, 2025)
+if _status_gate_ok; then status_note_function; fi
 

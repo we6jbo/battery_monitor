@@ -1,0 +1,48 @@
+================================================================
+[2025-08-16 11:43:30] Battery Monitor Automated Test — Aug 16, 11:33 PM
+Host: we6jbo
+User: we6jbo
+Repo: /home/we6jbo/battery_monitor
+Relay: http://127.0.0.1:8165
+================================================================
+[2025-08-16 11:43:31] Sanity checks
+- Checking relay /status...
+  status: {"signal": "ok", "relay_version": "1.0.0"}
+- Checking metrics.csv presence...
+  metrics.csv lines BEFORE: 9629
+================================================================
+[2025-08-16 11:43:31] Kickoff test (2 minutes)
+- POST /signal...
+  response: {"ok": true}
+[2025-08-16 11:43:41] poll#1  status={"signal": "ok", "relay_version": "1.0.0"}
+[2025-08-16 11:43:41] poll#1  payload={}
+[2025-08-16 11:43:51] poll#2  status={"signal": "ok", "relay_version": "1.0.0"}
+[2025-08-16 11:43:51] poll#2  payload={}
+[2025-08-16 11:44:01] poll#3  status={"signal": "ok", "relay_version": "1.0.0"}
+[2025-08-16 11:44:01] poll#3  payload={}
+[2025-08-16 11:44:11] poll#4  status={"signal": "ok", "relay_version": "1.0.0"}
+[2025-08-16 11:44:11] poll#4  payload={}
+[2025-08-16 11:44:21] poll#5  status={"signal": "ok", "relay_version": "1.0.0"}
+[2025-08-16 11:44:21] poll#5  payload={}
+[2025-08-16 11:44:31] poll#6  status={"signal": "ok", "relay_version": "1.0.0"}
+[2025-08-16 11:44:31] poll#6  payload={}
+[2025-08-16 11:44:41] poll#7  status={"signal": "ok", "relay_version": "1.0.0"}
+[2025-08-16 11:44:41] poll#7  payload={}
+[2025-08-16 11:44:51] poll#8  status={"signal": "ok", "relay_version": "1.0.0"}
+[2025-08-16 11:44:51] poll#8  payload={}
+[2025-08-16 11:45:01] poll#9  status={"signal": "ok", "relay_version": "1.0.0"}
+[2025-08-16 11:45:01] poll#9  payload={}
+[2025-08-16 11:45:11] poll#10  status={"signal": "ok", "relay_version": "1.0.0"}
+[2025-08-16 11:45:11] poll#10  payload={}
+[2025-08-16 11:45:21] poll#11  status={"signal": "ok", "relay_version": "1.0.0"}
+[2025-08-16 11:45:21] poll#11  payload={}
+[2025-08-16 11:45:31] poll#12  status={"signal": "ok", "relay_version": "1.0.0"}
+[2025-08-16 11:45:31] poll#12  payload={}
+- POST /clear...
+  response: {"ok": true}
+================================================================
+[2025-08-16 11:45:31] Post-test metrics
+  metrics.csv lines AFTER: 9652
+  lines appended: 23
+================================================================
+[2025-08-16 11:45:31] Writing report to /home/we6jbo/battery_monitor/report_Aug16.txt
